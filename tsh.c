@@ -40,7 +40,7 @@
 /* Global variables */
 extern char **environ;      /* defined in libc */
 char prompt[] = "tsh> ";    /* command line prompt (DO NOT CHANGE) */
-int verbose = 0;            /* if true, print additional output */
+int verbose =  0;            /* if true, print additional output */
 int nextjid = 1;            /* next job ID to allocate */
 char sbuf[MAXLINE];         /* for composing sprintf messages */
 
@@ -118,7 +118,7 @@ int main(int argc, char **argv)
     }
 
     /* Install the signal handlers */
-
+    
     /* These are the ones you will need to implement */
     Signal(SIGINT,  sigint_handler);   /* ctrl-c */
     Signal(SIGTSTP, sigtstp_handler);  /* ctrl-z */
@@ -143,8 +143,8 @@ int main(int argc, char **argv)
 	if (feof(stdin)) { /* End of file (ctrl-d) */
 	    fflush(stdout);
 	    exit(0);
-	}
-
+	} 
+    
 	/* Evaluate the command line */
 	eval(cmdline);
 	fflush(stdout);
@@ -155,7 +155,7 @@ int main(int argc, char **argv)
 }
   
 /* 
- * eval - Evaluate the command line that the user has just typed in
+ * eval - Evaluate the command line that the user  has just typed in
  * 
  * If the user has requested a built-in command (quit, jobs, bg or fg)
  * then execute it immediately. Otherwise, fork a child process and
@@ -167,26 +167,44 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
-    char **argv;
+    char *argv[MAXARGS];
     int bg = parseline(cmdline, argv);
     pid_t pid;
+    sigset_t mask, prev;
+    sigemptyset(&mask);
+    sigaddset(&mask,SIGCHLD);
+    //忽略空行
     if (argv[0]==NULL) {
         return;
     }
-    if (!builtin_cmd(argv)) {
-        if ((pid=Fork())==0) {
+    int isBC = builtin_cmd(argv);
+    if (!isBC) {
+        //先block住sihchld信号
+        sigprocmask(SIG_BLOCK, &mask, &prev);
+        if ((pid=fork())==0) {
+            setpgid(0, 0);  //将子进程组号设为子进程的pid，以便通过pid给group发信号
+            sigprocmask(SIG_SETMASK, &prev, NULL);
             if (execve(argv[0],argv,environ)<0) {
-                unix_error(argv[0]);
-                exit(0);
+                printf("%s: Command not found\n",argv[0]);
+                exit(1);
             }
         }else
         {
             if (bg) {
-                printf("%d %s",pid, cmdline);
-                //addjob();
+                addjob(jobs, pid, BG, cmdline);
+                if(sigprocmask(SIG_SETMASK, &prev, NULL)<0)
+                {
+                    unix_error("sigprocmask failed.");
+                }
+                printf("[%d] (%d) %s",pid2jid(pid), pid, cmdline);
             }else
             {
-                waitfg(pid);
+                addjob(jobs, pid, FG, cmdline);
+                if(sigprocmask(SIG_SETMASK, &prev, NULL)<0)
+                {
+                    unix_error("sigprocmask failed.");
+                }
+                waitfg(pid);  //等到前台死掉为止
             }
         }
     }
@@ -222,7 +240,6 @@ int parseline(const char *cmdline, char **argv)
     else {
 	delim = strchr(buf, ' ');
     }
-
     while (delim) {
 	argv[argc++] = buf;
 	*delim = '\0';
@@ -259,22 +276,22 @@ int builtin_cmd(char **argv)
     if (!strcmp(argv[0],"quit")) {
         exit(0);
     }
+    else if (!strcmp(argv[0],"&")) {
+        return 1;
+    }
     else if (!strcmp(argv[0],"jobs")) {
-        listjobs();
+        listjobs(jobs);
         return 1;
     }
     else if (!strcmp(argv[0],"bg")||!strcmp(argv[0],"fg")) {
         if (argv[1]==NULL) {
-            unix_error("argument invalid");
+            printf("%s command requires PID or %%jobid argument\n",argv[0]);
         }else
         {
             do_bgfg(argv);
         }
         return 1;
-    } else if (!strcmp(argv[0],"kill")) {
-        /* code */
     }
-    
     return 0;     /* not a builtin command */
 }
 
@@ -283,6 +300,47 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    pid_t pid;
+    int pjid;
+    
+    struct job_t *job;
+    //读job id
+    if (argv[1][0]=='%') {
+        pjid = atoi(argv[1]+1);
+        job = getjobjid(jobs, pjid);
+        if (job==NULL) {
+            printf("%s: No such job\n",argv[1]);
+            return;
+        }
+    }else
+    {
+        //读pid
+        pjid = atoi(argv[1]);
+        if (pjid<=0&&(argv[1][0]<'0'||argv[1][0]>'9')) {
+            printf("%s: argument must be a PID or %%jobid\n",argv[0]);
+            return;
+        }
+        job = getjobpid(jobs, pjid);
+        if (job==NULL) {
+            printf("(%d): No such process\n",pjid);
+            return;
+        }
+    }
+    //发-pid，给整个group发kill
+    pid = job->pid;
+    if (kill(-pid,SIGCONT)<0) {
+        printf("do_bgfg error\n");
+        return;
+    }
+    if (!strcmp(argv[0],"bg")) {
+        printf("[%d] (%d) %s",job->jid, job->pid, job->cmdline);
+        job->state = BG;
+    }else
+    {
+        //等到它死为止
+        job->state = FG;
+        waitfg(pid);
+    }
     return;
 }
 
@@ -291,6 +349,10 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    //精妙的等待，为了不卡住后台的子进程，用sleep
+    while(getjobpid(jobs, pid)!=NULL&&getjobpid(jobs, pid)->state!=ST){
+        sleep(2);
+    }
     return;
 }
 
@@ -307,6 +369,39 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    int olderrno = errno;
+    int status;
+    pid_t pid = 0;
+    while((pid=waitpid(-1, &status, WNOHANG|WUNTRACED))>0){
+        //通过status处理键盘的ctrl z/c,和别的进程kill过来的SIGINT和SIGTSTP
+        if (WIFSTOPPED(status))
+        {
+            //暂停了
+            struct job_t *job = getjobpid(jobs, pid);
+            printf("Job [%d] (%d) stopped by signal 20\n",job->jid,pid);
+            job->state = ST;
+        } else
+        {
+            //死掉了
+            int jid = pid2jid(pid);
+            if (deletejob(jobs, pid)) {
+                if (WIFEXITED(status)) {
+                    //exit死的，是错误命令或者是打印命令，直接返回
+                    errno = olderrno;
+                    return;
+                } else if (WIFSIGNALED(status)) 
+                {
+                    //被kill死的，打印信息，并继续循环看还有没有死的
+                    printf("Job [%d] (%d) terminated by signal 2\n",jid,pid);
+                } 
+            }
+        }
+    }
+    if (errno!=ECHILD && errno != 4) {
+        printf("%d  %d",errno,ECHILD);
+        unix_error("waitpid error");
+    }
+    errno = olderrno;
     return;
 }
 
@@ -317,6 +412,11 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+    //给每个前台的家伙发个SIGINT，清理工作交给sigchld_handler
+    if (kill(-1*pid,SIGINT)<0) {
+        unix_error("sigint error");
+    }
     return;
 }
 
@@ -327,6 +427,15 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+    if (pid==0) {
+        return;
+    }
+    //给前台每个家伙发个SIGTSTP，停止工作交给sigchld_handler
+    if (kill(-1*pid,SIGTSTP)<0) {
+        unix_error("sigtstp error");
+        return;
+    }
     return;
 }
 
